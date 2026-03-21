@@ -8,14 +8,14 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "asv"
-description = "Airspeed Velocity: A simple Python history benchmarking tool"
+name = "lsv"
+description = "Lightspeed Velocity: An expanded version of ASV for diff-based Python benchmarking"
 readme = "README.rst"
 license = "BSD-3-Clause"
 license-files = ["LICENSE.rst"]
 requires-python = ">=3.9"
 authors = [
-    { name = "Michael Droettboom", email = "mdroe@stsci.edu" },
+    { name = "Arjun Sharma", email = "asharma3@caltech.edu" },
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
