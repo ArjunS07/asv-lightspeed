@@ -1,0 +1,521 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+
+"""
+Python API for ASV Lightspeed — selective benchmark re-running for RL pipelines.
+
+    from asv.contrib.lightspeed import LightspeedSession
+
+    session = LightspeedSession(
+        "/workspace/repo/benchmarks/asv.conf.json",
+        overrides={"results_dir": "/output/results"},
+        machine="ci",
+    )
+    init   = session.initialize_diffcheck(source_root="/workspace/repo/shapely")
+    result = session.measure_impacted(changed_files=["src/foo.py"])
+    for name, delta in result.benchmarks.items():
+        print(f"{name}: {delta.baseline_str} -> {delta.current_str} ({delta.delta_pct:+.1f}%)")
+"""
+
+import itertools
+import json
+import os
+import platform
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from ...benchmarks import Benchmarks
+from ...config import Config
+from ...environment import get_environments
+from ...runner import run_benchmarks
+from ... import util
+from .deps_db import BenchmarkId, LightspeedDB
+from .fingerprint import changed_files_with_fingerprints
+from .survey import run_survey
+
+_DEPS_DB_FILENAME = ".lightspeed_deps.db"
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class ASVError(Exception):
+    """Base exception for all Lightspeed API errors."""
+
+
+class ConfigError(ASVError):
+    """Invalid or unreadable config file."""
+
+
+class BenchmarkError(ASVError):
+    """A benchmark failed to run."""
+    def __init__(self, message, *, benchmark_name=None, stderr=None):
+        super().__init__(message)
+        self.benchmark_name = benchmark_name
+        self.stderr = stderr
+
+
+class NoBenchmarksError(ASVError):
+    """No benchmarks were selected or found."""
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TimingInfo:
+    total_s: float
+    phases: Optional[Dict[str, float]] = None
+
+
+@dataclass
+class InitResult:
+    benchmarks_discovered: List[str]   # All benchmark ID strings found
+    benchmarks_impactable: List[str]   # Benchmarks with coverage-mapped deps
+    source_files_covered: int          # Distinct source files in dep table
+    deps_db_path: Path                 # Absolute path to .lightspeed_deps.db
+    timing: TimingInfo
+
+
+@dataclass
+class BenchmarkDelta:
+    name: str                          # Fully-qualified benchmark ID string
+    baseline: Optional[float]          # Baseline median in seconds
+    current: Optional[float]           # Current median in seconds
+    delta_pct: Optional[float]         # % change (positive = slower)
+    baseline_str: str                  # Human-readable, e.g. "1.230ms"
+    current_str: str                   # Human-readable, e.g. "1.450ms"
+    params: Optional[dict]             # Param dict for parameterised benchmarks
+
+
+@dataclass
+class MeasureResult:
+    benchmarks: Dict[str, BenchmarkDelta]  # Keyed by benchmark ID string
+    selected_count: int                     # Benchmarks actually re-run
+    total_count: int                        # Total benchmarks in suite
+    skipped_count: int                      # Benchmarks skipped (unaffected)
+    timing: TimingInfo
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _fmt(s: Optional[float]) -> str:
+    if s is None:
+        return "n/a"
+    if s >= 1.0:
+        return f"{s:.3f}s"
+    if s >= 1e-3:
+        return f"{s * 1e3:.3f}ms"
+    if s >= 1e-6:
+        return f"{s * 1e6:.3f}us"
+    return f"{s * 1e9:.3f}ns"
+
+
+def _all_bids(benchmarks: Benchmarks) -> List[BenchmarkId]:
+    bids = []
+    for name, benchmark in benchmarks.items():
+        params = benchmark.get("params")
+        if params:
+            for i in range(len(list(itertools.product(*params)))):
+                bids.append(BenchmarkId(name, i))
+        else:
+            bids.append(BenchmarkId(name))
+    return bids
+
+
+def _store_baseline(asv_results, benchmarks: Benchmarks, db: LightspeedDB):
+    for name, benchmark in benchmarks.items():
+        result_vals = asv_results._results.get(name)
+        stats_list = asv_results._stats.get(name)
+        if result_vals is None or stats_list is None:
+            continue
+        if benchmark.get("params"):
+            for idx, (val, stat) in enumerate(zip(result_vals, stats_list)):
+                if val is not None and stat is not None:
+                    db.store_baseline(BenchmarkId(name, idx), val, stat)
+        else:
+            val = result_vals[0] if result_vals else None
+            stat = stats_list[0] if stats_list else None
+            if val is not None and stat is not None:
+                db.store_baseline(BenchmarkId(name), val, stat)
+
+
+def _extract_deltas(
+    asv_results,
+    benchmarks: Benchmarks,
+    baseline: Dict[str, dict],
+) -> Dict[str, BenchmarkDelta]:
+    out: Dict[str, BenchmarkDelta] = {}
+    for name, benchmark in benchmarks.items():
+        result_vals = asv_results._results.get(name)
+        if result_vals is None:
+            continue
+        params_spec = benchmark.get("params")
+        if params_spec:
+            combos = list(itertools.product(*params_spec))
+            stats_list = asv_results._stats.get(name) or [None] * len(result_vals)
+            for idx, (val, _stat) in enumerate(zip(result_vals, stats_list)):
+                bid_str = str(BenchmarkId(name, idx))
+                base = baseline.get(bid_str)
+                delta_pct = None
+                if val is not None and base is not None:
+                    delta_pct = (val - base["median"]) / base["median"] * 100
+                params_dict = (
+                    {f"p{i}": v for i, v in enumerate(combos[idx])}
+                    if idx < len(combos) else None
+                )
+                out[bid_str] = BenchmarkDelta(
+                    name=bid_str,
+                    baseline=base["median"] if base else None,
+                    current=val,
+                    delta_pct=delta_pct,
+                    baseline_str=_fmt(base["median"] if base else None),
+                    current_str=_fmt(val),
+                    params=params_dict,
+                )
+        else:
+            val = result_vals[0] if result_vals else None
+            base = baseline.get(name)
+            delta_pct = None
+            if val is not None and base is not None:
+                delta_pct = (val - base["median"]) / base["median"] * 100
+            out[name] = BenchmarkDelta(
+                name=name,
+                baseline=base["median"] if base else None,
+                current=val,
+                delta_pct=delta_pct,
+                baseline_str=_fmt(base["median"] if base else None),
+                current_str=_fmt(val),
+                params=None,
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# LightspeedSession
+# ---------------------------------------------------------------------------
+
+class LightspeedSession:
+    """
+    Main entry point for the Lightspeed Python API.
+
+    Parameters
+    ----------
+    config_path : str or Path
+        Path to ``asv.conf.json``.  Resolved to absolute; relative paths in
+        the config are resolved against this file's parent directory.
+    overrides : dict, optional
+        Config field overrides applied in-memory.  Any key valid in the JSON
+        config is valid here (e.g. ``results_dir``, ``repo``, ``branches``).
+    machine : str, optional
+        Machine name.  Defaults to ``socket.gethostname()``.
+        ``{results_dir}/{machine}/machine.json`` is created automatically.
+    python : str, optional
+        Python spec.  ``"same"`` (default) uses the current interpreter.
+    """
+
+    def __init__(
+        self,
+        config_path,
+        *,
+        overrides: Optional[dict] = None,
+        machine: Optional[str] = None,
+        python: str = "same",
+    ):
+        config_path = Path(config_path).resolve()
+        try:
+            conf = Config.load(str(config_path))
+        except Exception as exc:
+            raise ConfigError(f"Failed to load config {config_path}: {exc}") from exc
+
+        if overrides:
+            for k, v in overrides.items():
+                setattr(conf, k, v)
+
+        # Resolve relative paths against the config file's parent directory so
+        # the session works regardless of the caller's cwd.
+        config_dir = config_path.parent
+        for attr in ("benchmark_dir", "results_dir", "html_dir", "env_dir"):
+            val = getattr(conf, attr, None)
+            if val and not Path(val).is_absolute():
+                setattr(conf, attr, str(config_dir / val))
+
+        self._setup(conf, config_path, machine, python)
+
+    @classmethod
+    def _from_conf(cls, conf, config_path=None, *, machine=None, python="same"):
+        """
+        Create a session from an already-loaded Config object.
+
+        Used by CLI commands, which receive a pre-loaded conf from ASV's
+        ``Command.run_from_args`` machinery.  Paths in *conf* are left as-is.
+        """
+        session = cls.__new__(cls)
+        session._setup(conf, config_path, machine, python)
+        return session
+
+    def _setup(self, conf, config_path, machine, python):
+        conf.dvcs = "none"
+        self._conf = conf
+        self._config_path = Path(config_path).resolve() if config_path else None
+        self._machine = machine or socket.gethostname()
+        self._python = python
+        self._ensure_machine_dir()
+
+    # --- Properties --------------------------------------------------------
+
+    @property
+    def config_path(self) -> Optional[Path]:
+        return self._config_path
+
+    @property
+    def benchmark_dir(self) -> Path:
+        return Path(self._conf.benchmark_dir)
+
+    @property
+    def results_dir(self) -> Path:
+        return Path(self._conf.results_dir)
+
+    @property
+    def env_dir(self) -> Path:
+        return Path(self._conf.env_dir)
+
+    @property
+    def repo(self) -> str:
+        return self._conf.repo
+
+    @property
+    def machine(self) -> str:
+        return self._machine
+
+    @property
+    def python(self) -> str:
+        return self._python
+
+    @property
+    def deps_db_path(self) -> Path:
+        return Path(self._conf.results_dir) / _DEPS_DB_FILENAME
+
+    # --- Internal ----------------------------------------------------------
+
+    def _ensure_machine_dir(self):
+        machine_dir = Path(self._conf.results_dir) / self._machine
+        machine_dir.mkdir(parents=True, exist_ok=True)
+        machine_json = machine_dir / "machine.json"
+        if not machine_json.exists():
+            machine_json.write_text(json.dumps({
+                "machine": self._machine,
+                "os": platform.platform(),
+                "arch": platform.machine(),
+                "cpu": platform.processor() or "unknown",
+                "ram": "0",
+                "version": 1,
+            }, indent=2))
+
+    def _get_env(self):
+        envs = list(get_environments(self._conf, [f"existing:{self._python}"]))
+        if not envs:
+            raise ASVError(f"No environment available for python={self._python!r}")
+        env = envs[0]
+        env.create()
+        return env
+
+    def _load_benchmarks(self, regex=None) -> Benchmarks:
+        try:
+            return Benchmarks.load(self._conf, regex=regex)
+        except util.UserError:
+            from ...repo import NoRepository
+            envs = list(get_environments(self._conf, [f"existing:{self._python}"]))
+            b = Benchmarks.discover(self._conf, NoRepository(), envs, [None], regex=regex)
+            b.save()
+            return b
+
+    # --- Public API --------------------------------------------------------
+
+    def initialize_diffcheck(self, source_root, *, force: bool = False) -> InitResult:
+        """
+        Survey benchmark dependencies and record baseline timing.
+
+        Pass 1 — coverage survey: record which source files each benchmark
+        touches, storing method-level fingerprints in ``.lightspeed_deps.db``.
+
+        Pass 2 — baseline timing: measure current performance via ASV's full
+        timing protocol and store results in the same SQLite database.
+
+        Parameters
+        ----------
+        source_root : str or Path
+            Root of the source package to analyse.  Only files within this
+            directory are recorded in the dependency table.
+        force : bool
+            Re-run both passes even if a baseline already exists.
+        """
+        t0 = time.perf_counter()
+        phases: Dict[str, float] = {}
+
+        source_root = str(Path(source_root).resolve())
+        if not os.path.isdir(source_root):
+            raise ASVError(f"source_root is not a directory: {source_root}")
+
+        benchmarks = self._load_benchmarks()
+        if not benchmarks:
+            raise NoBenchmarksError("No benchmarks found")
+
+        bids = _all_bids(benchmarks)
+        db = LightspeedDB(str(self.deps_db_path))
+
+        if not force and all(db.has_baseline(bid) for bid in bids):
+            impactable = [
+                r[0] for r in db._con.execute(
+                    "SELECT DISTINCT benchmark_id FROM benchmark_dep"
+                ).fetchall()
+            ]
+            n_files = db._con.execute(
+                "SELECT COUNT(DISTINCT filename) FROM benchmark_dep"
+            ).fetchone()[0]
+            return InitResult(
+                benchmarks_discovered=[str(b) for b in bids],
+                benchmarks_impactable=impactable,
+                source_files_covered=n_files,
+                deps_db_path=self.deps_db_path,
+                timing=TimingInfo(total_s=time.perf_counter() - t0),
+            )
+
+        t1 = time.perf_counter()
+        run_survey(str(self.benchmark_dir), source_root, db, bids)
+        phases["coverage"] = time.perf_counter() - t1
+
+        t2 = time.perf_counter()
+        env = self._get_env()
+        lm = getattr(self._conf, "launch_method", None) or "auto"
+        asv_results = run_benchmarks(benchmarks, env, launch_method=lm)
+        phases["benchmarking"] = time.perf_counter() - t2
+
+        _store_baseline(asv_results, benchmarks, db)
+
+        impactable = [
+            r[0] for r in db._con.execute(
+                "SELECT DISTINCT benchmark_id FROM benchmark_dep"
+            ).fetchall()
+        ]
+        n_files = db._con.execute(
+            "SELECT COUNT(DISTINCT filename) FROM benchmark_dep"
+        ).fetchone()[0]
+
+        return InitResult(
+            benchmarks_discovered=[str(b) for b in bids],
+            benchmarks_impactable=impactable,
+            source_files_covered=n_files,
+            deps_db_path=self.deps_db_path,
+            timing=TimingInfo(total_s=time.perf_counter() - t0, phases=phases),
+        )
+
+    def measure_impacted(
+        self,
+        *,
+        from_git_diff: bool = False,
+        changed_files=None,
+    ) -> MeasureResult:
+        """
+        Selectively re-run benchmarks affected by code changes.
+
+        Exactly one of ``from_git_diff=True`` or ``changed_files=[...]``
+        must be provided.
+
+        Parameters
+        ----------
+        from_git_diff : bool
+            Detect changed files via ``git diff HEAD --name-only``.
+        changed_files : list of str or Path, optional
+            Explicit list of changed file paths.  Takes precedence over
+            ``from_git_diff`` if both are supplied.
+        """
+        if not from_git_diff and changed_files is None:
+            raise ValueError("Provide either from_git_diff=True or changed_files=[...]")
+
+        t0 = time.perf_counter()
+
+        if not self.deps_db_path.exists():
+            raise ASVError(
+                f"Dependency database not found: {self.deps_db_path}\n"
+                "Call initialize_diffcheck() first."
+            )
+
+        benchmarks = self._load_benchmarks()
+        total_count = len(benchmarks)
+        db = LightspeedDB(str(self.deps_db_path))
+
+        baseline = {
+            str(bid): b
+            for bid in db.get_all_benchmark_ids()
+            if (b := db.get_baseline(bid)) is not None
+        }
+
+        if changed_files is not None:
+            paths = [str(Path(p).resolve()) for p in changed_files]
+        else:
+            try:
+                raw = subprocess.check_output(
+                    ["git", "diff", "HEAD", "--name-only"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                paths = [os.path.abspath(p) for p in raw.splitlines()] if raw else []
+            except subprocess.CalledProcessError as exc:
+                raise ASVError(f"'git diff HEAD' failed: {exc}") from exc
+
+        _empty = MeasureResult(
+            benchmarks={},
+            selected_count=0,
+            total_count=total_count,
+            skipped_count=total_count,
+            timing=TimingInfo(total_s=time.perf_counter() - t0),
+        )
+
+        if not paths:
+            return _empty
+
+        changes = changed_files_with_fingerprints(paths, db.get_stored_fshas())
+        affected_bids = db.get_affected_benchmark_ids(changes)
+        if not affected_bids:
+            return _empty
+
+        affected_names = {bid.name for bid in affected_bids}
+        filtered = benchmarks.filter_out(set(benchmarks.keys()) - affected_names)
+
+        env = self._get_env()
+        lm = getattr(self._conf, "launch_method", None) or "auto"
+        asv_results = run_benchmarks(filtered, env, launch_method=lm)
+
+        deltas = _extract_deltas(asv_results, filtered, baseline)
+
+        return MeasureResult(
+            benchmarks=deltas,
+            selected_count=len(filtered),
+            total_count=total_count,
+            skipped_count=total_count - len(filtered),
+            timing=TimingInfo(total_s=time.perf_counter() - t0),
+        )
+
+    def get_results(self) -> Dict[str, Optional[float]]:
+        """
+        Return stored baseline timing from the SQLite database.
+
+        Returns
+        -------
+        dict[str, float | None]
+            Map of benchmark ID string to baseline median time in seconds.
+        """
+        if not self.deps_db_path.exists():
+            return {}
+        db = LightspeedDB(str(self.deps_db_path))
+        rows = db._con.execute(
+            "SELECT benchmark_id, median FROM baseline"
+        ).fetchall()
+        return {r["benchmark_id"]: r["median"] for r in rows}
