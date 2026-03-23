@@ -37,6 +37,22 @@ class InitializeDiffcheck(Command):
         )
         common_args.add_bench(parser)
         common_args.add_launch_method(parser)
+        parser.add_argument(
+            "--rounds", type=int, default=None, metavar="N",
+            help=(
+                "Number of timing rounds per benchmark. Defaults to the "
+                "benchmark's own setting (typically 2). More rounds produce a "
+                "more accurate baseline at the cost of wall-clock time."
+            ),
+        )
+        parser.add_argument(
+            "--repeat", type=int, default=None, metavar="N",
+            help="Samples collected per round (default: auto, 1–10).",
+        )
+        parser.add_argument(
+            "--warmup-time", type=float, default=None, metavar="SECS",
+            help="Seconds spent warming up before timing (default: auto).",
+        )
         parser.set_defaults(func=cls.run_from_args)
         return parser
 
@@ -46,16 +62,23 @@ class InitializeDiffcheck(Command):
             conf=conf,
             source_root=args.source_root,
             force=args.force,
+            rounds=args.rounds,
+            repeat=args.repeat,
+            warmup_time=args.warmup_time,
             launch_method=getattr(args, "launch_method", None),
         )
 
     @classmethod
-    def run(cls, conf, source_root, force=False, launch_method=None):
+    def run(cls, conf, source_root, force=False, rounds=None, repeat=None,
+            warmup_time=None, launch_method=None):
         if launch_method:
             conf.launch_method = launch_method
 
         session = LightspeedSession._from_conf(conf)
-        result = session.initialize_diffcheck(source_root, force=force)
+        result = session.initialize_diffcheck(
+            source_root, force=force,
+            rounds=rounds, repeat=repeat, warmup_time=warmup_time,
+        )
 
         log.info(
             f"Done. {len(result.benchmarks_discovered)} benchmark(s) discovered, "

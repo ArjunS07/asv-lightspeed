@@ -58,6 +58,22 @@ class MeasureImpacted(Command):
         )
         common_args.add_bench(parser)
         common_args.add_launch_method(parser)
+        parser.add_argument(
+            "--rounds", type=int, default=None, metavar="N",
+            help=(
+                "Number of timing rounds per benchmark. For per-step RL "
+                "measurements 1 is usually sufficient. Defaults to the "
+                "benchmark's own setting (typically 2)."
+            ),
+        )
+        parser.add_argument(
+            "--repeat", type=int, default=None, metavar="N",
+            help="Samples collected per round (default: auto, 1–10).",
+        )
+        parser.add_argument(
+            "--warmup-time", type=float, default=None, metavar="SECS",
+            help="Seconds spent warming up before timing (default: auto).",
+        )
         parser.set_defaults(func=cls.run_from_args)
         return parser
 
@@ -68,13 +84,17 @@ class MeasureImpacted(Command):
             changed_files=args.changed_files,
             from_git_diff=args.from_git_diff,
             step_id=args.step_id,
+            rounds=args.rounds,
+            repeat=args.repeat,
+            warmup_time=args.warmup_time,
             launch_method=getattr(args, "launch_method", None),
         )
 
     @classmethod
     def run(
         cls, conf, changed_files=None, from_git_diff=False,
-        step_id=None, launch_method=None,
+        step_id=None, rounds=None, repeat=None, warmup_time=None,
+        launch_method=None,
     ):
         if launch_method:
             conf.launch_method = launch_method
@@ -83,6 +103,9 @@ class MeasureImpacted(Command):
         result = session.measure_impacted(
             from_git_diff=from_git_diff,
             changed_files=changed_files,
+            rounds=rounds,
+            repeat=repeat,
+            warmup_time=warmup_time,
         )
 
         if not result.benchmarks:

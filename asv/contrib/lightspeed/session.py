@@ -147,6 +147,18 @@ def _store_baseline(asv_results, benchmarks: Benchmarks, db: LightspeedDB):
                 db.store_baseline(BenchmarkId(name), val, stat)
 
 
+def _timing_params(rounds, repeat, warmup_time) -> dict:
+    """Build the extra_params dict for run_benchmarks() from optional overrides."""
+    p = {}
+    if rounds is not None:
+        p["rounds"] = rounds
+    if repeat is not None:
+        p["repeat"] = repeat
+    if warmup_time is not None:
+        p["warmup_time"] = warmup_time
+    return p
+
+
 def _extract_deltas(
     asv_results,
     benchmarks: Benchmarks,
@@ -339,7 +351,15 @@ class LightspeedSession:
 
     # --- Public API --------------------------------------------------------
 
-    def initialize_diffcheck(self, source_root, *, force: bool = False) -> InitResult:
+    def initialize_diffcheck(
+        self,
+        source_root,
+        *,
+        force: bool = False,
+        rounds: Optional[int] = None,
+        repeat: Optional[int] = None,
+        warmup_time: Optional[float] = None,
+    ) -> InitResult:
         """
         Survey benchmark dependencies and record baseline timing.
 
@@ -356,6 +376,17 @@ class LightspeedSession:
             directory are recorded in the dependency table.
         force : bool
             Re-run both passes even if a baseline already exists.
+        rounds : int, optional
+            Number of timing rounds per benchmark.  Defaults to the benchmark's
+            own setting (typically 2 via the ``processes`` backward-compat
+            attribute).  More rounds → more accurate baseline at the cost of
+            wall-clock time.
+        repeat : int, optional
+            Samples collected per round.  ``None`` means auto (ASV picks 1–10,
+            halved when ``rounds > 1``).
+        warmup_time : float, optional
+            Seconds spent warming up before timing begins.  ``None`` means auto
+            (≈1 s for multi-round, ≈5 s for single-round).
         """
         t0 = time.perf_counter()
         phases: Dict[str, float] = {}
@@ -392,10 +423,11 @@ class LightspeedSession:
         run_survey(str(self.benchmark_dir), source_root, db, bids)
         phases["coverage"] = time.perf_counter() - t1
 
+        extra_params = _timing_params(rounds, repeat, warmup_time)
         t2 = time.perf_counter()
         env = self._get_env()
         lm = getattr(self._conf, "launch_method", None) or "auto"
-        asv_results = run_benchmarks(benchmarks, env, launch_method=lm)
+        asv_results = run_benchmarks(benchmarks, env, extra_params=extra_params, launch_method=lm)
         phases["benchmarking"] = time.perf_counter() - t2
 
         _store_baseline(asv_results, benchmarks, db)
@@ -422,6 +454,9 @@ class LightspeedSession:
         *,
         from_git_diff: bool = False,
         changed_files=None,
+        rounds: Optional[int] = None,
+        repeat: Optional[int] = None,
+        warmup_time: Optional[float] = None,
     ) -> MeasureResult:
         """
         Selectively re-run benchmarks affected by code changes.
@@ -436,6 +471,13 @@ class LightspeedSession:
         changed_files : list of str or Path, optional
             Explicit list of changed file paths.  Takes precedence over
             ``from_git_diff`` if both are supplied.
+        rounds : int, optional
+            Number of timing rounds.  For per-step RL measurements, ``1`` is
+            usually sufficient since deltas are relative to the baseline.
+        repeat : int, optional
+            Samples per round.  ``None`` means auto.
+        warmup_time : float, optional
+            Warmup seconds.  ``None`` means auto.
         """
         if not from_git_diff and changed_files is None:
             raise ValueError("Provide either from_git_diff=True or changed_files=[...]")
@@ -489,9 +531,10 @@ class LightspeedSession:
         affected_names = {bid.name for bid in affected_bids}
         filtered = benchmarks.filter_out(set(benchmarks.keys()) - affected_names)
 
+        extra_params = _timing_params(rounds, repeat, warmup_time)
         env = self._get_env()
         lm = getattr(self._conf, "launch_method", None) or "auto"
-        asv_results = run_benchmarks(filtered, env, launch_method=lm)
+        asv_results = run_benchmarks(filtered, env, extra_params=extra_params, launch_method=lm)
 
         deltas = _extract_deltas(asv_results, filtered, baseline)
 
