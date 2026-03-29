@@ -11,7 +11,6 @@ build-backend = "setuptools.build_meta"
 name = "lsv"
 description = "Lightspeed Velocity: An expanded version of ASV for diff-based Python benchmarking"
 readme = "README.rst"
-license = {text = "BSD-3-Clause"}
 requires-python = ">=3.8"
 dynamic = [
     "version",
