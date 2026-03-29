@@ -12,26 +12,7 @@ name = "lsv"
 description = "Lightspeed Velocity: An expanded version of ASV for diff-based Python benchmarking"
 readme = "README.rst"
 license = {text = "BSD-3-Clause"}
-license-files = ["LICENSE.rst"]
-requires-python = ">=3.9"
-authors = [
-    { name = "Arjun Sharma", email = "asharma3@caltech.edu" },
-]
-classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Environment :: Console",
-    "Environment :: Web Environment",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
-    "Topic :: Software Development :: Testing",
-]
+requires-python = ">=3.8"
 dynamic = [
     "version",
 ]
