@@ -138,7 +138,10 @@ class LightspeedDB:
           (a) it is marked always_affected, OR
           (b) it has a dep on a changed file AND the stored fingerprint
               is NOT a subset of the current method_checksums for that file
-              (i.e. some code block it previously touched has changed).
+              (i.e. some code block it previously touched has changed), OR
+          (c) it has a dep on a changed file AND no benchmark was selected
+              by fingerprint matching for that file (fallback to maximise
+              recall — the change may affect uncovered code paths).
         """
         affected: Set[str] = set()
 
@@ -157,15 +160,30 @@ class LightspeedDB:
                 """,
                 (filename,),
             ).fetchall()
+            if not deps:
+                continue
             current_set = set(current_checksums)
+            file_affected: Set[str] = set()
+            all_dep_bids: Set[str] = set()
             for row in deps:
                 stored_checksums = _blob_to_checksums(row["method_checksums"])
                 stored_fsha = row["fsha"]
+                all_dep_bids.add(row["benchmark_id"])
                 if stored_fsha == current_fsha:
                     continue
                 # If any stored fingerprint block is absent from the current checksums, the code the benchmark touched has changed.
                 if set(stored_checksums) - current_set:
-                    affected.add(row["benchmark_id"])
+                    file_affected.add(row["benchmark_id"])
+
+            if file_affected:
+                affected.update(file_affected)
+            else:
+                # Fallback: the file changed (different SHA) but no benchmark
+                # was selected by method-level fingerprinting. This happens
+                # when the change is in a function that no benchmark directly
+                # covered (e.g. a utility called indirectly). Select all
+                # benchmarks that depend on this file to maximise recall.
+                affected.update(all_dep_bids)
 
         return [_parse_bid(bid_str) for bid_str in affected]
 

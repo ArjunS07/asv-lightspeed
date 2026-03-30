@@ -201,6 +201,11 @@ def survey_one(
 
             lines: Set[int] = set(cov_data.lines(fname) or [])
             if not lines:
+                # File was measured but no line-level data — use whole-file
+                # fingerprint so changes to it still trigger re-runs.
+                fp, sha = file_method_checksums(fname)
+                if sha is not None:
+                    file_deps[fname] = (fp, sha)
                 continue
 
             fp, sha = coverage_fingerprint(fname, lines)
@@ -208,12 +213,10 @@ def survey_one(
                 continue
             file_deps[fname] = (fp, sha)
 
-    # Fallback: if coverage found no Python files in source_root (common for
-    # C extension packages installed non-editable from site-packages), scan
-    # all loaded modules for .so/.pyd extensions whose package has source
-    # files under source_root, and add those C/Cython sources as deps.
-    if not file_deps:
-        _add_extension_deps(file_deps, source_root)
+    # Always scan for C extension deps — mixed Python/C projects need both.
+    # Previously this only ran as a fallback when no Python coverage was found,
+    # which meant C/Cython source changes were invisible in mixed projects.
+    _add_extension_deps(file_deps, source_root)
 
     if not file_deps:
         return False, "no_source_root_coverage", {}

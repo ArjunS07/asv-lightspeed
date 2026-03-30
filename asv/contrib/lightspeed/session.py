@@ -501,14 +501,18 @@ class LightspeedSession:
         }
 
         if changed_files is not None:
-            paths = [str(Path(p).resolve()) for p in changed_files]
+            paths = [os.path.abspath(p) for p in changed_files]
         else:
             try:
+                repo_root = subprocess.check_output(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
                 raw = subprocess.check_output(
                     ["git", "diff", "HEAD", "--name-only"],
                     stderr=subprocess.DEVNULL,
                 ).decode().strip()
-                paths = [os.path.abspath(p) for p in raw.splitlines()] if raw else []
+                paths = [os.path.abspath(os.path.join(repo_root, p)) for p in raw.splitlines()] if raw else []
             except subprocess.CalledProcessError as exc:
                 raise ASVError(f"'git diff HEAD' failed: {exc}") from exc
 

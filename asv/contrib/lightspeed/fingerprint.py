@@ -3,6 +3,7 @@ File fingerprinting adapted from testmon's process_code.py.
 
 """
 
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -73,6 +74,7 @@ def changed_files_with_fingerprints(
     for p in paths:
         current_sha = fsha(p)
         if current_sha is None:
+            warnings.warn(f"lightspeed: could not read {p}, skipping fingerprint")
             continue
         if stored_fshas.get(p) == current_sha:
             continue
