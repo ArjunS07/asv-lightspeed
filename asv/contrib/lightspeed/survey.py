@@ -149,7 +149,7 @@ def survey_one(
     skip = False
     try:
         skip = bench.do_setup()
-    except Exception as exc:
+    except BaseException as exc:
         return False, f"setup_error: {exc}", {}
 
     if skip:
@@ -164,7 +164,7 @@ def survey_one(
             bench.func(*bench._current_params)
         finally:
             cov.stop()
-    except Exception as exc:
+    except BaseException as exc:
         bench.do_teardown()
         return False, f"runtime_error: {exc}", {}
     finally:
