@@ -180,7 +180,7 @@ def run_benchmarks(
         if 'rounds' in extra_params:
             return int(extra_params['rounds'])
         else:
-            return int(benchmark.get('rounds', 1))
+            return int(benchmark.get('rounds', 2))
 
     for name, benchmark in sorted(benchmarks.items()):
         # Set benchmark timeout from config if not set
