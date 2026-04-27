@@ -32,7 +32,7 @@ from ...config import Config
 from ...environment import get_environments
 from ...runner import run_benchmarks
 from ... import util
-from .deps_db import BenchmarkId, LightspeedDB
+from .deps_db import BenchmarkId, LightspeedDB, _parse_bid
 from .fingerprint import changed_files_with_fingerprints
 from .survey import run_survey
 
@@ -566,3 +566,78 @@ class LightspeedSession:
             "SELECT benchmark_id, median FROM baseline"
         ).fetchall()
         return {r["benchmark_id"]: r["median"] for r in rows}
+
+    def export_baselines(self) -> Dict[str, Dict[str, float]]:
+        """
+        Dump every stored baseline as a serializable mapping.
+
+        Returns
+        -------
+        dict[str, dict]
+            ``{benchmark_id_str: {"median", "ci_99_a", "ci_99_b", "q_25", "q_75",
+            "repeat", "number"}}``.  Empty dict if the deps DB does not exist or
+            no baselines have been recorded yet.
+
+        Notes
+        -----
+        Pair with :meth:`load_baselines` to ship measured baselines between
+        runs (e.g. cache the results of ``initialize_diffcheck`` keyed by
+        machine fingerprint, then reload them on a fresh sandbox to skip the
+        timing pass).
+        """
+        if not self.deps_db_path.exists():
+            return {}
+        db = LightspeedDB(str(self.deps_db_path))
+        out: Dict[str, Dict[str, float]] = {}
+        for bid in db.get_all_benchmark_ids():
+            row = db.get_baseline(bid)
+            if row is None:
+                continue
+            out[str(bid)] = {
+                "median":  row["median"],
+                "ci_99_a": row["ci_99_a"],
+                "ci_99_b": row["ci_99_b"],
+                "q_25":    row["q_25"],
+                "q_75":    row["q_75"],
+                "repeat":  row["repeat"],
+                "number":  row["number"],
+            }
+        return out
+
+    def load_baselines(self, payload: Dict[str, Dict[str, float]]) -> int:
+        """
+        Bulk-insert (or replace) baseline timings from a serialized payload.
+
+        Parameters
+        ----------
+        payload : dict
+            Output of :meth:`export_baselines` from a prior run on equivalent
+            hardware.  Each value must contain the same keys exported there.
+
+        Returns
+        -------
+        int
+            Number of baseline rows written.
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``deps_db_path`` does not yet exist; stage a cached deps DB
+            (or run :meth:`initialize_diffcheck` once) before calling this.
+
+        Notes
+        -----
+        After this returns, ``initialize_diffcheck(force=False)`` will
+        short-circuit when every benchmark id has a baseline row.
+        """
+        if not self.deps_db_path.exists():
+            raise FileNotFoundError(
+                f"deps DB missing at {self.deps_db_path}; "
+                "stage a cached copy or run initialize_diffcheck first"
+            )
+        db = LightspeedDB(str(self.deps_db_path))
+        n = 0
+        for bid_str, stats in payload.items():
+            db.store_baseline(_parse_bid(bid_str), stats["median"], stats)
+            n += 1
+        return n
